@@ -53,6 +53,10 @@ struct Cli {
     #[arg(short, long)]
     qr: bool,
 
+    /// Show this image file instead of the text, until typing or Esc removes it
+    #[arg(long, value_name = "PATH")]
+    image: Option<String>,
+
     /// Count down for this long, shown in place of {countdown}, e.g. 90 (seconds), 5m or 1h30m
     #[arg(long, value_parser = parse_timer, group = "countdown")]
     timer: Option<Timestamp>,
@@ -97,6 +101,7 @@ pub struct Config {
     pub padding: Padding,
     pub raw: bool,
     pub qr: bool,
+    pub image: Option<String>,
     pub countdown: Option<Countdown>,
 }
 
@@ -143,6 +148,7 @@ impl From<Cli> for Config {
             padding: cli.pad,
             raw: cli.raw,
             qr: cli.qr,
+            image: cli.image,
             countdown: cli.timer.or(cli.until).map(|end| Countdown {
                 end,
                 zero: cli.zero,

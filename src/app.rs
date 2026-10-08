@@ -1,7 +1,7 @@
 //! The fullscreen window. An `NSTextView` does the editing, so input methods, paste,
 //! undo and the emoji picker work without extra code. We only resize and place it.
 //! While the cursor is hidden, a second, read-only view shows the formatted text, or an
-//! image view shows it as a QR code, instead.
+//! image view shows it as a QR code, instead. The image view also shows pasted images.
 
 use std::cell::{Cell, RefCell};
 use std::io::Read;
@@ -15,7 +15,7 @@ use jiff::{Timestamp, Zoned};
 use objc2::rc::Retained;
 use objc2::runtime::Bool;
 use objc2::runtime::ProtocolObject;
-use objc2::{MainThreadMarker, MainThreadOnly, Message, define_class, msg_send, sel};
+use objc2::{AnyThread, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
     NSApplicationActivationPolicy, NSApplicationPresentationOptions,
@@ -23,9 +23,10 @@ use objc2_app_kit::{
     NSColorSpace, NSCursor, NSEvent, NSEventMask, NSEventModifierFlags, NSEventType, NSFont,
     NSFontAttributeName, NSFontFeatureSelectorIdentifierKey, NSFontFeatureSettingsAttribute,
     NSFontFeatureTypeIdentifierKey, NSFontManager, NSFontTraitMask, NSFontWeightRegular, NSImage,
-    NSImageScaling, NSImageView, NSMenu, NSMenuItem, NSScreen, NSStrikethroughStyleAttributeName,
-    NSStringDrawingOptions, NSTextAlignment, NSTextDidChangeNotification, NSTextField,
-    NSTextInputClient, NSTextInputTraitType, NSTextView, NSView, NSWindow, NSWindowStyleMask,
+    NSImageScaling, NSImageView, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString,
+    NSScreen, NSStrikethroughStyleAttributeName, NSStringDrawingOptions, NSTextAlignment,
+    NSTextDidChangeNotification, NSTextField, NSTextInputClient, NSTextInputTraitType, NSTextView,
+    NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{
     NSActivityOptions, NSArray, NSAttributedString, NSDictionary, NSMutableAttributedString,
@@ -81,6 +82,8 @@ struct App {
     countdown: Option<Countdown>,
     /// The text last shown formatted, after filling in placeholders.
     shown: RefCell<String>,
+    /// A pasted image, shown instead of the text until typing or Esc removes it.
+    image: RefCell<Option<Retained<NSImage>>>,
     font_family: Option<String>,
     quarter_turns: u8,
     align: Align,
@@ -111,6 +114,15 @@ pub fn run(config: Config) {
             unsafe { squint.text_view.selectAll(None) };
         }
         Input::Stdin => read_stdin(Arc::new(MainThreadBound::new(squint.clone(), mtm))),
+    }
+    if let Some(path) = &config.image {
+        let image = NSImage::initWithContentsOfFile(NSImage::alloc(), &NSString::from_str(path))
+            .filter(|image| image.size().width > 0.0 && image.size().height > 0.0);
+        let Some(image) = image else {
+            eprintln!("squint: cannot read image \"{path}\"");
+            std::process::exit(1);
+        };
+        squint.image.replace(Some(image));
     }
     squint.relayout();
     squint.tick();
@@ -202,6 +214,7 @@ impl App {
             raw: config.raw,
             countdown: config.countdown.clone(),
             shown: RefCell::new(String::new()),
+            image: RefCell::new(None),
             font_family: config.font.clone(),
             quarter_turns: config.quarter_turns,
             align: config.align,
@@ -236,9 +249,10 @@ impl App {
     }
 
     /// Shows the source while typing and the formatted text otherwise, each scaled to fill
-    /// the screen.
+    /// the screen. A pasted image takes precedence over both.
     fn relayout(&self) {
-        let editing = self.cursor_visible.get();
+        let pasted = self.image.borrow().clone();
+        let editing = self.cursor_visible.get() && pasted.is_none();
         // The editor stays first responder while invisible, so typing switches back to it.
         self.text_view
             .setAlphaValue(if editing { 1.0 } else { 0.0 });
@@ -267,13 +281,15 @@ impl App {
         } else {
             let text = placeholders::fill(&source, &Zoned::now(), self.countdown.as_ref());
             // Text too long for a QR code shows as text instead.
-            let image = (self.qr && !text.is_empty())
-                .then(|| qr::Modules::encode(&text))
-                .flatten()
-                .map(|modules| {
-                    let (foreground, background) = &*self.colors.borrow();
-                    qr_image(modules, foreground.clone(), background.clone())
-                });
+            let image = pasted.or_else(|| {
+                (self.qr && !text.is_empty())
+                    .then(|| qr::Modules::encode(&text))
+                    .flatten()
+                    .map(|modules| {
+                        let (foreground, background) = &*self.colors.borrow();
+                        qr_image(modules, foreground.clone(), background.clone())
+                    })
+            });
             self.display.setHidden(image.is_some());
             self.image_view.setHidden(image.is_none());
             match image {
@@ -511,11 +527,21 @@ impl App {
         std::mem::forget(monitor);
     }
 
+    /// Shows `image` instead of the text, or the text again without one. Cmd-Z reverts it.
+    fn set_image(self: &Rc<Self>, image: Option<Retained<NSImage>>) {
+        let previous = self.image.replace(image);
+        if let Some(undo) = self.text_view.undoManager() {
+            let app = self.clone();
+            let block = RcBlock::new(move |_| app.set_image(previous.clone()));
+            unsafe { undo.registerUndoWithTarget_handler(&self.text_view, &block) };
+        }
+        self.relayout();
+    }
+
     /// Returns whether the key was consumed.
-    fn handle_key(&self, event: &NSEvent) -> bool {
-        let control = event
-            .modifierFlags()
-            .contains(NSEventModifierFlags::Control);
+    fn handle_key(self: &Rc<Self>, event: &NSEvent) -> bool {
+        let modifiers = event.modifierFlags();
+        let control = modifiers.contains(NSEventModifierFlags::Control);
         let key = event
             .charactersIgnoringModifiers()
             .map(|s| s.to_string().to_lowercase());
@@ -523,10 +549,20 @@ impl App {
         match (control, key.as_deref()) {
             (true, Some("q")) => NSApplication::sharedApplication(mtm).terminate(None),
             (true, Some("i")) => self.invert(),
+            (false, Some("v")) if modifiers.contains(NSEventModifierFlags::Command) => {
+                match pasted_image() {
+                    Some(image) => self.set_image(Some(image)),
+                    None => return false,
+                }
+            }
             // Esc also cancels input method composition, which must keep working.
             _ if event.keyCode() == ESCAPE_KEY_CODE && !self.text_view.hasMarkedText() => {
                 // Holding Esc would otherwise clear and quit in one go.
                 if event.isARepeat() {
+                    return true;
+                }
+                if self.image.borrow().is_some() {
+                    self.set_image(None);
                     return true;
                 }
                 if self.text_view.string().length() == 0 {
@@ -545,7 +581,14 @@ impl App {
 
     fn observe_edits(self: &Rc<Self>) {
         let app = self.clone();
-        let block = RcBlock::new(move |_| app.relayout());
+        let block = RcBlock::new(move |_| {
+            // Typing replaces a pasted image.
+            if app.image.borrow().is_some() {
+                app.set_image(None);
+            } else {
+                app.relayout();
+            }
+        });
         let observer = unsafe {
             NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
                 Some(NSTextDidChangeNotification),
@@ -670,6 +713,20 @@ fn qr_image(
         Bool::YES
     });
     NSImage::imageWithSize_flipped_drawingHandler(NSSize::new(side, side), true, &draw)
+}
+
+/// The image on the clipboard, unless it also holds text. Apps like Keynote put an image
+/// of copied text next to the text itself.
+fn pasted_image() -> Option<Retained<NSImage>> {
+    let pasteboard = NSPasteboard::generalPasteboard();
+    if pasteboard
+        .stringForType(unsafe { NSPasteboardTypeString })
+        .is_some()
+    {
+        return None;
+    }
+    NSImage::initWithPasteboard(NSImage::alloc(), &pasteboard)
+        .filter(|image| image.size().width > 0.0 && image.size().height > 0.0)
 }
 
 fn luminance(color: &NSColor) -> f64 {
