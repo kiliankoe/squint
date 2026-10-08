@@ -2,6 +2,7 @@ mod app;
 mod layout;
 mod markdown;
 mod placeholders;
+mod qr;
 mod stdin;
 
 use clap::Parser;
@@ -48,6 +49,10 @@ struct Cli {
     #[arg(long)]
     raw: bool,
 
+    /// Show the text as a QR code
+    #[arg(short, long)]
+    qr: bool,
+
     /// Count down for this long, shown in place of {countdown}, e.g. 90 (seconds), 5m or 1h30m
     #[arg(long, value_parser = parse_timer, group = "countdown")]
     timer: Option<Timestamp>,
@@ -91,6 +96,7 @@ pub struct Config {
     pub align: Align,
     pub padding: Padding,
     pub raw: bool,
+    pub qr: bool,
     pub countdown: Option<Countdown>,
 }
 
@@ -136,6 +142,7 @@ impl From<Cli> for Config {
             align,
             padding: cli.pad,
             raw: cli.raw,
+            qr: cli.qr,
             countdown: cli.timer.or(cli.until).map(|end| Countdown {
                 end,
                 zero: cli.zero,

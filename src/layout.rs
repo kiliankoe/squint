@@ -69,11 +69,11 @@ impl std::str::FromStr for Padding {
     }
 }
 
-/// Font size that makes text measured at `reference` points as large as fits on `screen`.
+/// Factor by which something of size `content` grows to be as large as fits on `screen`.
 /// `quarter_turns` is the rotation in 90° steps, as with sm's `-r`.
-pub fn fit_font_size(reference: f64, measured: Size, screen: Size, quarter_turns: u8) -> f64 {
-    let rotated = rotate(measured, quarter_turns);
-    reference * f64::min(screen.width / rotated.width, screen.height / rotated.height)
+pub fn fit_scale(content: Size, screen: Size, quarter_turns: u8) -> f64 {
+    let rotated = rotate(content, quarter_turns);
+    f64::min(screen.width / rotated.width, screen.height / rotated.height)
 }
 
 /// Origin of the unrotated text frame such that, once rotated around its center,
@@ -133,26 +133,14 @@ mod tests {
 
     #[test]
     fn fits_the_tighter_dimension() {
-        assert_eq!(
-            fit_font_size(100.0, size(200.0, 100.0), size(1000.0, 1000.0), 0),
-            500.0
-        );
-        assert_eq!(
-            fit_font_size(100.0, size(100.0, 100.0), size(1000.0, 300.0), 0),
-            300.0
-        );
+        assert_eq!(fit_scale(size(200.0, 100.0), size(1000.0, 1000.0), 0), 5.0);
+        assert_eq!(fit_scale(size(100.0, 100.0), size(1000.0, 300.0), 0), 3.0);
     }
 
     #[test]
     fn rotation_swaps_dimensions() {
-        assert_eq!(
-            fit_font_size(100.0, size(200.0, 100.0), size(1000.0, 500.0), 1),
-            250.0
-        );
-        assert_eq!(
-            fit_font_size(100.0, size(200.0, 100.0), size(1000.0, 500.0), 2),
-            500.0
-        );
+        assert_eq!(fit_scale(size(200.0, 100.0), size(1000.0, 500.0), 1), 2.5);
+        assert_eq!(fit_scale(size(200.0, 100.0), size(1000.0, 500.0), 2), 5.0);
     }
 
     #[test]

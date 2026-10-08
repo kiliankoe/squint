@@ -1,6 +1,7 @@
 //! The fullscreen window. An `NSTextView` does the editing, so input methods, paste,
 //! undo and the emoji picker work without extra code. We only resize and place it.
-//! While the cursor is hidden, a second, read-only view shows the formatted text instead.
+//! While the cursor is hidden, a second, read-only view shows the formatted text, or an
+//! image view shows it as a QR code, instead.
 
 use std::cell::{Cell, RefCell};
 use std::io::Read;
@@ -12,18 +13,19 @@ use block2::RcBlock;
 use dispatch2::{DispatchQueue, MainThreadBound};
 use jiff::{Timestamp, Zoned};
 use objc2::rc::Retained;
+use objc2::runtime::Bool;
 use objc2::runtime::ProtocolObject;
 use objc2::{MainThreadMarker, MainThreadOnly, Message, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
     NSApplicationActivationPolicy, NSApplicationPresentationOptions,
-    NSAttributedStringNSExtendedStringDrawing, NSBackingStoreType, NSColor, NSCursor, NSEvent,
-    NSEventMask, NSEventModifierFlags, NSEventType, NSFont, NSFontAttributeName,
-    NSFontFeatureSelectorIdentifierKey, NSFontFeatureSettingsAttribute,
-    NSFontFeatureTypeIdentifierKey, NSFontManager, NSFontTraitMask, NSFontWeightRegular, NSMenu,
-    NSMenuItem, NSScreen, NSStrikethroughStyleAttributeName, NSStringDrawingOptions,
-    NSTextAlignment, NSTextDidChangeNotification, NSTextField, NSTextInputClient,
-    NSTextInputTraitType, NSTextView, NSWindow, NSWindowStyleMask,
+    NSAttributedStringNSExtendedStringDrawing, NSBackingStoreType, NSBezierPath, NSColor,
+    NSColorSpace, NSCursor, NSEvent, NSEventMask, NSEventModifierFlags, NSEventType, NSFont,
+    NSFontAttributeName, NSFontFeatureSelectorIdentifierKey, NSFontFeatureSettingsAttribute,
+    NSFontFeatureTypeIdentifierKey, NSFontManager, NSFontTraitMask, NSFontWeightRegular, NSImage,
+    NSImageScaling, NSImageView, NSMenu, NSMenuItem, NSScreen, NSStrikethroughStyleAttributeName,
+    NSStringDrawingOptions, NSTextAlignment, NSTextDidChangeNotification, NSTextField,
+    NSTextInputClient, NSTextInputTraitType, NSTextView, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{
     NSActivityOptions, NSArray, NSAttributedString, NSDictionary, NSMutableAttributedString,
@@ -33,6 +35,7 @@ use objc2_foundation::{
 use crate::layout::{self, Align, Padding, Size};
 use crate::markdown::{self, Run};
 use crate::placeholders::{self, Countdown};
+use crate::qr;
 use crate::stdin::Frames;
 use crate::{Color, Config, Input};
 
@@ -70,6 +73,8 @@ struct App {
     window: Retained<KeyWindow>,
     text_view: Retained<NSTextView>,
     display: Retained<NSTextView>,
+    image_view: Retained<NSImageView>,
+    qr: bool,
     /// Lists the placeholders while typing.
     hint: Retained<NSTextField>,
     raw: bool,
@@ -177,8 +182,12 @@ impl App {
         hint.setFont(Some(&NSFont::systemFontOfSize(HINT_SIZE)));
         hint.sizeToFit();
 
+        let image_view = NSImageView::new(mtm);
+        image_view.setImageScaling(NSImageScaling::ScaleAxesIndependently);
+
         let content = window.contentView().expect("window has a content view");
         content.addSubview(&hint);
+        content.addSubview(&image_view);
         content.addSubview(&display);
         content.addSubview(&text_view);
         window.makeFirstResponder(Some(&text_view));
@@ -188,6 +197,8 @@ impl App {
             text_view,
             display,
             hint,
+            image_view,
+            qr: config.qr,
             raw: config.raw,
             countdown: config.countdown.clone(),
             shown: RefCell::new(String::new()),
@@ -231,7 +242,6 @@ impl App {
         // The editor stays first responder while invisible, so typing switches back to it.
         self.text_view
             .setAlphaValue(if editing { 1.0 } else { 0.0 });
-        self.display.setHidden(editing);
         self.hint.setHidden(!editing);
         let frame = self.window.frame();
         let hint = self.hint.frame().size;
@@ -243,6 +253,8 @@ impl App {
 
         let source = self.text_view.string().to_string();
         if editing {
+            self.display.setHidden(true);
+            self.image_view.setHidden(true);
             let mut text = source;
             // A trailing empty line, where the cursor sits after Return, needs room too.
             if text.is_empty() || text.ends_with('\n') {
@@ -254,24 +266,21 @@ impl App {
             self.text_view.setFont(Some(&self.font_or_system(size)));
         } else {
             let text = placeholders::fill(&source, &Zoned::now(), self.countdown.as_ref());
-            let runs = if self.raw {
-                vec![Run {
-                    text: text.clone(),
-                    style: markdown::PLAIN,
-                }]
-            } else {
-                markdown::parse(&text)
-            };
-            self.shown.replace(text);
-            let storage = unsafe { self.display.textStorage() }.expect("text view has storage");
-            if runs.is_empty() {
-                storage.setAttributedString(&NSAttributedString::new());
-            } else {
-                let size = self.place(&self.display, |size| self.styled(&runs, size));
-                storage.setAttributedString(&self.styled(&runs, size));
-                self.display.setTextColor(Some(&self.colors.borrow().0));
-                self.display.setAlignment(self.text_view.alignment());
+            // Text too long for a QR code shows as text instead.
+            let image = (self.qr && !text.is_empty())
+                .then(|| qr::Modules::encode(&text))
+                .flatten()
+                .map(|modules| {
+                    let (foreground, background) = &*self.colors.borrow();
+                    qr_image(modules, foreground.clone(), background.clone())
+                });
+            self.display.setHidden(image.is_some());
+            self.image_view.setHidden(image.is_none());
+            match image {
+                Some(image) => self.show_image(&image),
+                None => self.show_formatted(&text),
             }
+            self.shown.replace(text);
         }
         // Rotated views leave stale pixels behind when they move, so repaint everything.
         self.window.contentView().unwrap().setNeedsDisplay(true);
@@ -298,35 +307,82 @@ impl App {
         unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(delay, false, &block) };
     }
 
+    fn show_formatted(&self, text: &str) {
+        let runs = if self.raw {
+            vec![Run {
+                text: text.into(),
+                style: markdown::PLAIN,
+            }]
+        } else {
+            markdown::parse(text)
+        };
+        let storage = unsafe { self.display.textStorage() }.expect("text view has storage");
+        if runs.is_empty() {
+            storage.setAttributedString(&NSAttributedString::new());
+            return;
+        }
+        let size = self.place(&self.display, |size| self.styled(&runs, size));
+        storage.setAttributedString(&self.styled(&runs, size));
+        self.display.setTextColor(Some(&self.colors.borrow().0));
+        self.display.setAlignment(self.text_view.alignment());
+    }
+
+    fn show_image(&self, image: &NSImage) {
+        let size = image.size();
+        let size = Size {
+            width: size.width,
+            height: size.height,
+        };
+        let scale = layout::fit_scale(size, self.screen().1, self.quarter_turns);
+        self.image_view.setImage(Some(image));
+        self.set_frame(
+            &self.image_view,
+            Size {
+                width: size.width * scale,
+                height: size.height * scale,
+            },
+        );
+    }
+
     /// Picks the font size at which `build` makes text that fills the screen, and places
     /// `view` to show that text. Returns the font size.
     fn place(&self, view: &NSTextView, build: impl Fn(f64) -> Retained<NSAttributedString>) -> f64 {
+        let reference = measure(&build(REFERENCE_SIZE));
+        let size =
+            REFERENCE_SIZE * layout::fit_scale(reference, self.screen().1, self.quarter_turns);
+        let mut measured = measure(&build(size));
+        // Slightly wider than measured, so rounding never wraps a line.
+        measured.width += 1.0;
+        if let Some(container) = unsafe { view.textContainer() } {
+            container.setSize(NSSize::new(measured.width, f64::MAX));
+        }
+        self.set_frame(view, measured);
+        size
+    }
+
+    /// The area inside the padding: its offset from the bottom left corner, and its size.
+    fn screen(&self) -> ((f64, f64), Size) {
         let frame = self.window.frame();
         // On notched displays, the strip beside the camera is unusable for text.
         let notch = self.window.screen().map_or(0.0, |s| s.safeAreaInsets().top);
-        let ((left, bottom), screen) = self.padding.inset(Size {
+        self.padding.inset(Size {
             width: frame.size.width,
             height: frame.size.height - notch,
-        });
+        })
+    }
 
-        let reference = measure(&build(REFERENCE_SIZE));
-        let size = layout::fit_font_size(REFERENCE_SIZE, reference, screen, self.quarter_turns);
-        let measured = measure(&build(size));
-
-        if let Some(container) = unsafe { view.textContainer() } {
-            // Slightly wider than measured, so rounding never wraps a line.
-            container.setSize(NSSize::new(measured.width + 1.0, f64::MAX));
-        }
-        let (x, y) = layout::text_origin(measured, screen, self.quarter_turns, self.align);
+    /// Places `view`, `size` large before rotation, on the screen.
+    fn set_frame(&self, view: &NSView, size: Size) {
+        let ((left, bottom), screen) = self.screen();
+        let (x, y) = layout::text_origin(size, screen, self.quarter_turns, self.align);
         // Rotation applies around the view's center, so set the unrotated frame first.
         view.setFrameCenterRotation(0.0);
         view.setFrame(NSRect::new(
             NSPoint::new(left + x, bottom + y),
-            NSSize::new(measured.width + 1.0, measured.height),
+            NSSize::new(size.width, size.height),
         ));
         // AppKit rotates counterclockwise, sm clockwise.
         view.setFrameCenterRotation(-90.0 * f64::from(self.quarter_turns));
-        size
     }
 
     /// Formatted text with body text at `size` points.
@@ -392,6 +448,8 @@ impl App {
             std::mem::swap(foreground, background);
         }
         self.apply_colors();
+        // QR codes are drawn with the color they were made with.
+        self.relayout();
     }
 
     /// Shows or hides the insertion point and the selection highlight, and switches between
@@ -575,6 +633,51 @@ fn tabular_digits(font: &NSFont) -> Retained<NSFont> {
             .fontDescriptorByAddingAttributes(&attributes)
     };
     NSFont::fontWithDescriptor_size(&descriptor, font.pointSize()).unwrap_or_else(|| font.retain())
+}
+
+/// A QR code in the given colors, drawn at whatever size it is shown so it stays sharp.
+fn qr_image(
+    modules: qr::Modules,
+    foreground: Retained<NSColor>,
+    background: Retained<NSColor>,
+) -> Retained<NSImage> {
+    // The light border scanners need around the code, in modules.
+    const QUIET_ZONE: usize = 4;
+    let side = (modules.width + 2 * QUIET_ZONE) as f64;
+    let draw = RcBlock::new(move |rect: NSRect| -> Bool {
+        // Many scanners only read dark modules on light, so the colors may swap. They
+        // resolve here, as the appearance can change while squint runs.
+        let (mut dark, mut light) = (&foreground, &background);
+        if luminance(dark) > luminance(light) {
+            std::mem::swap(&mut dark, &mut light);
+        }
+        light.setFill();
+        NSBezierPath::fillRect(rect);
+        // One path for all modules, so neighbors join without antialiased seams.
+        let path = NSBezierPath::bezierPath();
+        for y in 0..modules.width {
+            for x in 0..modules.width {
+                if modules.is_dark(x, y) {
+                    path.appendBezierPathWithRect(NSRect::new(
+                        NSPoint::new((x + QUIET_ZONE) as f64, (y + QUIET_ZONE) as f64),
+                        NSSize::new(1.0, 1.0),
+                    ));
+                }
+            }
+        }
+        dark.setFill();
+        path.fill();
+        Bool::YES
+    });
+    NSImage::imageWithSize_flipped_drawingHandler(NSSize::new(side, side), true, &draw)
+}
+
+fn luminance(color: &NSColor) -> f64 {
+    color
+        .colorUsingColorSpace(&NSColorSpace::sRGBColorSpace())
+        .map_or(0.0, |c| {
+            0.2126 * c.redComponent() + 0.7152 * c.greenComponent() + 0.0722 * c.blueComponent()
+        })
 }
 
 fn plain(text: &str, font: &NSFont) -> Retained<NSAttributedString> {
