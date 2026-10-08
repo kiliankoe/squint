@@ -22,8 +22,8 @@ use objc2_app_kit::{
     NSFontFeatureSelectorIdentifierKey, NSFontFeatureSettingsAttribute,
     NSFontFeatureTypeIdentifierKey, NSFontManager, NSFontTraitMask, NSFontWeightRegular, NSMenu,
     NSMenuItem, NSScreen, NSStrikethroughStyleAttributeName, NSStringDrawingOptions,
-    NSTextAlignment, NSTextDidChangeNotification, NSTextInputClient, NSTextInputTraitType,
-    NSTextView, NSWindow, NSWindowStyleMask,
+    NSTextAlignment, NSTextDidChangeNotification, NSTextField, NSTextInputClient,
+    NSTextInputTraitType, NSTextView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{
     NSActivityOptions, NSArray, NSAttributedString, NSDictionary, NSMutableAttributedString,
@@ -43,6 +43,9 @@ const CURSOR_TIMEOUT: f64 = 1.5;
 const REFERENCE_SIZE: f64 = 100.0;
 
 const ESCAPE_KEY_CODE: u16 = 53;
+
+/// Font size of the placeholder hint.
+const HINT_SIZE: f64 = 14.0;
 
 define_class!(
     // Borderless windows refuse key status by default, which would block typing.
@@ -67,6 +70,8 @@ struct App {
     window: Retained<KeyWindow>,
     text_view: Retained<NSTextView>,
     display: Retained<NSTextView>,
+    /// Lists the placeholders while typing.
+    hint: Retained<NSTextField>,
     raw: bool,
     countdown: Option<Countdown>,
     /// The text last shown formatted, after filling in placeholders.
@@ -163,7 +168,17 @@ impl App {
         display.setEditable(false);
         display.setSelectable(false);
 
+        let mut placeholders = vec![placeholders::CLOCK];
+        if config.countdown.is_some() {
+            placeholders.push(placeholders::COUNTDOWN);
+        }
+        let hint =
+            NSTextField::labelWithString(&NSString::from_str(&placeholders.join("   ")), mtm);
+        hint.setFont(Some(&NSFont::systemFontOfSize(HINT_SIZE)));
+        hint.sizeToFit();
+
         let content = window.contentView().expect("window has a content view");
+        content.addSubview(&hint);
         content.addSubview(&display);
         content.addSubview(&text_view);
         window.makeFirstResponder(Some(&text_view));
@@ -172,6 +187,7 @@ impl App {
             window,
             text_view,
             display,
+            hint,
             raw: config.raw,
             countdown: config.countdown.clone(),
             shown: RefCell::new(String::new()),
@@ -216,6 +232,14 @@ impl App {
         self.text_view
             .setAlphaValue(if editing { 1.0 } else { 0.0 });
         self.display.setHidden(editing);
+        self.hint.setHidden(!editing);
+        let frame = self.window.frame();
+        let hint = self.hint.frame().size;
+        self.hint.setFrameOrigin(NSPoint::new(
+            ((frame.size.width - hint.width) / 2.0).round(),
+            // Low enough to stay within the default padding.
+            HINT_SIZE / 3.0,
+        ));
 
         let source = self.text_view.string().to_string();
         if editing {
@@ -356,6 +380,8 @@ impl App {
         self.window.setBackgroundColor(Some(background));
         self.text_view.setTextColor(Some(foreground));
         self.display.setTextColor(Some(foreground));
+        self.hint
+            .setTextColor(Some(&foreground.colorWithAlphaComponent(0.4)));
         self.set_cursor_visible(self.cursor_visible.get());
     }
 
