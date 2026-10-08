@@ -40,16 +40,16 @@ struct Cli {
     align: u8,
 
     /// Space kept free at the screen edges, in percent of the screen height (top, bottom)
-    /// and width (left, right). One value for all sides, two for vertical and horizontal,
-    /// or four for top, right, bottom and left.
+    /// and width (left, right). One value for all sides, or comma-separated: two for
+    /// vertical and horizontal (5,10), four for top, right, bottom and left (2,5,2,5).
     #[arg(short, long, default_value = "3")]
     pad: Padding,
 
-    /// Show the text as typed, without Markdown formatting
+    /// Show the text without Markdown formatting
     #[arg(long)]
     raw: bool,
 
-    /// Show the text as a QR code
+    /// Show the text as a QR code, or as text if it is too long for one
     #[arg(short, long)]
     qr: bool,
 
@@ -58,20 +58,21 @@ struct Cli {
     image: Option<String>,
 
     /// Count down for this long, shown in place of {countdown}, e.g. 90 (seconds), 5m or 1h30m
-    #[arg(long, value_parser = parse_timer, group = "countdown")]
+    #[arg(long, value_name = "LENGTH", value_parser = parse_timer, group = "countdown")]
     timer: Option<Timestamp>,
 
     /// Count down to this local time, shown in place of {countdown}, e.g. 18:00, 2026-12-31
     /// or 2026-12-31T23:59
-    #[arg(long, value_parser = parse_until, group = "countdown")]
+    #[arg(long, value_name = "TIME", value_parser = parse_until, group = "countdown")]
     until: Option<Timestamp>,
 
     /// Text to show instead once the countdown reaches zero [default: the countdown stays at 0:00]
-    #[arg(long, requires = "countdown")]
+    #[arg(long, value_name = "TEXT", requires = "countdown")]
     zero: Option<String>,
 
-    /// Text to show. A single "-" reads it from stdin instead, where a form feed
-    /// character (\f) replaces the shown text with what came before it.
+    /// Text to show, formatted as Markdown. {clock} shows the current time. A single "-"
+    /// reads it from stdin instead, where a form feed character (\f) replaces the shown
+    /// text with what came before it.
     text: Vec<String>,
 }
 

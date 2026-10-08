@@ -24,7 +24,7 @@ Text is formatted as Markdown: `**bold**`, `*italic*`, `~~strikethrough~~`, `` `
 
 With `--qr`, the text shows as a QR code instead, always dark on light so phones can scan it.
 
-Paste an image with Cmd-V, or pass one with `--image`, to show it as large as possible instead of the text. Typing or Esc removes it again.
+Paste an image with Cmd-V, or pass one with `--image`, to show it as large as possible instead of the text. Typing or Esc removes it again, and Cmd-Z brings it back.
 
 Type to edit the text. The cursor appears while typing or clicking and hides after a moment of idling. Esc clears the text (Cmd-Z brings it back), a second Esc quits. Ctrl-I inverts the colors. Ctrl-Q or Cmd-Q quits directly.
 

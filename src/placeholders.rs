@@ -66,8 +66,8 @@ fn format_seconds(seconds: i64) -> String {
 
 /// Parses a countdown length such as `90` (seconds), `5m` or `1h30m`.
 pub fn parse_duration(spec: &str) -> Result<SignedDuration, String> {
-    let duration = match spec.parse::<u64>() {
-        Ok(seconds) => SignedDuration::from_secs(seconds as i64),
+    let duration = match spec.parse::<i64>() {
+        Ok(seconds) => SignedDuration::from_secs(seconds),
         Err(_) => spec
             .parse::<SignedDuration>()
             .map_err(|_| format!("\"{spec}\" is not a length like 90, 5m or 1h30m"))?,
@@ -174,6 +174,7 @@ mod tests {
         );
         assert!(parse_duration("soon").is_err());
         assert!(parse_duration("-5m").is_err());
+        assert!(parse_duration("18446744073709551615").is_err());
     }
 
     #[test]
