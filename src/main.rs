@@ -1,4 +1,5 @@
 mod app;
+mod image;
 mod layout;
 mod markdown;
 mod placeholders;

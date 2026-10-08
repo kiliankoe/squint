@@ -13,20 +13,18 @@ use block2::RcBlock;
 use dispatch2::{DispatchQueue, MainThreadBound};
 use jiff::{Timestamp, Zoned};
 use objc2::rc::Retained;
-use objc2::runtime::Bool;
 use objc2::runtime::ProtocolObject;
-use objc2::{AnyThread, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send, sel};
+use objc2::{MainThreadMarker, MainThreadOnly, Message, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
     NSApplicationActivationPolicy, NSApplicationPresentationOptions,
-    NSAttributedStringNSExtendedStringDrawing, NSBackingStoreType, NSBezierPath, NSColor,
-    NSColorSpace, NSCursor, NSEvent, NSEventMask, NSEventModifierFlags, NSEventType, NSFont,
-    NSFontAttributeName, NSFontFeatureSelectorIdentifierKey, NSFontFeatureSettingsAttribute,
+    NSAttributedStringNSExtendedStringDrawing, NSBackingStoreType, NSColor, NSCursor, NSEvent,
+    NSEventMask, NSEventModifierFlags, NSEventType, NSFont, NSFontAttributeName,
+    NSFontFeatureSelectorIdentifierKey, NSFontFeatureSettingsAttribute,
     NSFontFeatureTypeIdentifierKey, NSFontManager, NSFontTraitMask, NSFontWeightRegular, NSImage,
-    NSImageScaling, NSImageView, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString,
-    NSScreen, NSStrikethroughStyleAttributeName, NSStringDrawingOptions, NSTextAlignment,
-    NSTextDidChangeNotification, NSTextField, NSTextInputClient, NSTextInputTraitType, NSTextView,
-    NSView, NSWindow, NSWindowStyleMask,
+    NSImageScaling, NSImageView, NSMenu, NSMenuItem, NSScreen, NSStrikethroughStyleAttributeName,
+    NSStringDrawingOptions, NSTextAlignment, NSTextDidChangeNotification, NSTextField,
+    NSTextInputClient, NSTextInputTraitType, NSTextView, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{
     NSActivityOptions, NSArray, NSAttributedString, NSDictionary, NSMutableAttributedString,
@@ -36,9 +34,9 @@ use objc2_foundation::{
 use crate::layout::{self, Align, Padding, Size};
 use crate::markdown::{self, Run};
 use crate::placeholders::{self, Countdown};
-use crate::qr;
 use crate::stdin::Frames;
 use crate::{Color, Config, Input};
+use crate::{image, qr};
 
 /// How long the text cursor stays visible after the last keystroke or click.
 const CURSOR_TIMEOUT: f64 = 1.5;
@@ -116,9 +114,7 @@ pub fn run(config: Config) {
         Input::Stdin => read_stdin(Arc::new(MainThreadBound::new(squint.clone(), mtm))),
     }
     if let Some(path) = &config.image {
-        let image = NSImage::initWithContentsOfFile(NSImage::alloc(), &NSString::from_str(path))
-            .filter(|image| image.size().width > 0.0 && image.size().height > 0.0);
-        let Some(image) = image else {
+        let Some(image) = image::open(path) else {
             eprintln!("squint: cannot read image \"{path}\"");
             std::process::exit(1);
         };
@@ -284,13 +280,10 @@ impl App {
             let text = placeholders::fill(&source, &Zoned::now(), self.countdown.as_ref());
             // Text too long for a QR code shows as text instead.
             let image = pasted.or_else(|| {
+                let (foreground, background) = &*self.colors.borrow();
                 (self.qr && !text.is_empty())
-                    .then(|| qr::Modules::encode(&text))
+                    .then(|| qr::image(&text, foreground.clone(), background.clone()))
                     .flatten()
-                    .map(|modules| {
-                        let (foreground, background) = &*self.colors.borrow();
-                        qr_image(modules, foreground.clone(), background.clone())
-                    })
             });
             self.display.setHidden(image.is_some());
             self.image_view.setHidden(image.is_none());
@@ -553,7 +546,7 @@ impl App {
             (true, Some("q")) => NSApplication::sharedApplication(mtm).terminate(None),
             (true, Some("i")) => self.invert(),
             (false, Some("v")) if modifiers.contains(NSEventModifierFlags::Command) => {
-                match pasted_image() {
+                match image::pasted() {
                     Some(image) => self.set_image(Some(image)),
                     None => return false,
                 }
@@ -685,65 +678,6 @@ fn tabular_digits(font: &NSFont) -> Retained<NSFont> {
             .fontDescriptorByAddingAttributes(&attributes)
     };
     NSFont::fontWithDescriptor_size(&descriptor, font.pointSize()).unwrap_or_else(|| font.retain())
-}
-
-/// A QR code in the given colors, drawn at whatever size it is shown so it stays sharp.
-fn qr_image(
-    modules: qr::Modules,
-    foreground: Retained<NSColor>,
-    background: Retained<NSColor>,
-) -> Retained<NSImage> {
-    // The light border scanners need around the code, in modules.
-    const QUIET_ZONE: usize = 4;
-    let side = (modules.width + 2 * QUIET_ZONE) as f64;
-    let draw = RcBlock::new(move |rect: NSRect| -> Bool {
-        // Many scanners only read dark modules on light, so the colors may swap. They
-        // resolve here, as the appearance can change while squint runs.
-        let (mut dark, mut light) = (&foreground, &background);
-        if luminance(dark) > luminance(light) {
-            std::mem::swap(&mut dark, &mut light);
-        }
-        light.setFill();
-        NSBezierPath::fillRect(rect);
-        // One path for all modules, so neighbors join without antialiased seams.
-        let path = NSBezierPath::bezierPath();
-        for y in 0..modules.width {
-            for x in 0..modules.width {
-                if modules.is_dark(x, y) {
-                    path.appendBezierPathWithRect(NSRect::new(
-                        NSPoint::new((x + QUIET_ZONE) as f64, (y + QUIET_ZONE) as f64),
-                        NSSize::new(1.0, 1.0),
-                    ));
-                }
-            }
-        }
-        dark.setFill();
-        path.fill();
-        Bool::YES
-    });
-    NSImage::imageWithSize_flipped_drawingHandler(NSSize::new(side, side), true, &draw)
-}
-
-/// The image on the clipboard, unless it also holds text. Apps like Keynote put an image
-/// of copied text next to the text itself.
-fn pasted_image() -> Option<Retained<NSImage>> {
-    let pasteboard = NSPasteboard::generalPasteboard();
-    if pasteboard
-        .stringForType(unsafe { NSPasteboardTypeString })
-        .is_some()
-    {
-        return None;
-    }
-    NSImage::initWithPasteboard(NSImage::alloc(), &pasteboard)
-        .filter(|image| image.size().width > 0.0 && image.size().height > 0.0)
-}
-
-fn luminance(color: &NSColor) -> f64 {
-    color
-        .colorUsingColorSpace(&NSColorSpace::sRGBColorSpace())
-        .map_or(0.0, |c| {
-            0.2126 * c.redComponent() + 0.7152 * c.greenComponent() + 0.0722 * c.blueComponent()
-        })
 }
 
 fn plain(text: &str, font: &NSFont) -> Retained<NSAttributedString> {
