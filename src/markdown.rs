@@ -94,10 +94,12 @@ pub fn parse(source: &str) -> Vec<Run> {
                 }
             }
             // An escaped character is reported starting right after its backslash.
-            Event::Text(_) | Event::HardBreak
-                if range.start > 0 && source.as_bytes()[range.start - 1] == b'\\' =>
-            {
+            Event::Text(_) if range.start > 0 && source.as_bytes()[range.start - 1] == b'\\' => {
                 hide(range.start - 1..range.start);
+            }
+            // A backslash ending a line breaks it, which the line break already does.
+            Event::HardBreak if source[range.clone()].starts_with('\\') => {
+                hide(range.start..range.start + 1);
             }
             _ => {}
         }
@@ -230,5 +232,8 @@ mod tests {
     #[test]
     fn drops_escaping_backslashes() {
         assert_eq!(parse(r"\*not\* \\ a\b"), plain(r"*not* \ a\b"));
+        // A backslash at the end of a line is a line break; before two spaces it is text.
+        assert_eq!(parse("a\\\nb"), plain("a\nb"));
+        assert_eq!(parse("a\\  \nb"), plain("a\\  \nb"));
     }
 }
