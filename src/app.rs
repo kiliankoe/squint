@@ -22,8 +22,8 @@ use objc2_app_kit::{
     NSWindowStyleMask,
 };
 use objc2_foundation::{
-    NSArray, NSAttributedString, NSDictionary, NSNotificationCenter, NSPoint, NSRect, NSSize,
-    NSString, NSTimer,
+    NSActivityOptions, NSArray, NSAttributedString, NSDictionary, NSNotificationCenter, NSPoint,
+    NSProcessInfo, NSRect, NSSize, NSString, NSTimer,
 };
 
 use crate::layout::{self, Align, Size};
@@ -100,6 +100,13 @@ pub fn run(config: Config) {
         NSApplicationPresentationOptions::HideDock | NSApplicationPresentationOptions::HideMenuBar,
     );
     NSCursor::setHiddenUntilMouseMoves(true);
+    // A sign is useless once the display sleeps. The activity lasts as long as squint runs.
+    std::mem::forget(
+        NSProcessInfo::processInfo().beginActivityWithOptions_reason(
+            NSActivityOptions::IdleDisplaySleepDisabled | NSActivityOptions::UserInitiated,
+            &NSString::from_str("Showing text fullscreen"),
+        ),
+    );
     app.run();
 }
 
