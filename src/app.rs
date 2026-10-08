@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, MainThreadBound};
+use jiff::{Timestamp, Zoned};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{MainThreadMarker, MainThreadOnly, Message, define_class, msg_send, sel};
@@ -17,11 +18,12 @@ use objc2_app_kit::{
     NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
     NSApplicationActivationPolicy, NSApplicationPresentationOptions,
     NSAttributedStringNSExtendedStringDrawing, NSBackingStoreType, NSColor, NSCursor, NSEvent,
-    NSEventMask, NSEventModifierFlags, NSEventType, NSFont, NSFontAttributeName, NSFontManager,
-    NSFontTraitMask, NSFontWeightRegular, NSMenu, NSMenuItem, NSScreen,
-    NSStrikethroughStyleAttributeName, NSStringDrawingOptions, NSTextAlignment,
-    NSTextDidChangeNotification, NSTextInputClient, NSTextInputTraitType, NSTextView, NSWindow,
-    NSWindowStyleMask,
+    NSEventMask, NSEventModifierFlags, NSEventType, NSFont, NSFontAttributeName,
+    NSFontFeatureSelectorIdentifierKey, NSFontFeatureSettingsAttribute,
+    NSFontFeatureTypeIdentifierKey, NSFontManager, NSFontTraitMask, NSFontWeightRegular, NSMenu,
+    NSMenuItem, NSScreen, NSStrikethroughStyleAttributeName, NSStringDrawingOptions,
+    NSTextAlignment, NSTextDidChangeNotification, NSTextInputClient, NSTextInputTraitType,
+    NSTextView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{
     NSActivityOptions, NSArray, NSAttributedString, NSDictionary, NSMutableAttributedString,
@@ -30,6 +32,7 @@ use objc2_foundation::{
 
 use crate::layout::{self, Align, Padding, Size};
 use crate::markdown::{self, Run};
+use crate::placeholders::{self, Countdown};
 use crate::stdin::Frames;
 use crate::{Color, Config, Input};
 
@@ -65,6 +68,9 @@ struct App {
     text_view: Retained<NSTextView>,
     display: Retained<NSTextView>,
     raw: bool,
+    countdown: Option<Countdown>,
+    /// The text last shown formatted, after filling in placeholders.
+    shown: RefCell<String>,
     font_family: Option<String>,
     quarter_turns: u8,
     align: Align,
@@ -97,6 +103,7 @@ pub fn run(config: Config) {
         Input::Stdin => read_stdin(Arc::new(MainThreadBound::new(squint.clone(), mtm))),
     }
     squint.relayout();
+    squint.tick();
 
     squint.window.makeKeyAndOrderFront(None);
     // Cooperative activation (`NSApp.activate()`) is not granted when launched from a
@@ -166,6 +173,8 @@ impl App {
             text_view,
             display,
             raw: config.raw,
+            countdown: config.countdown.clone(),
+            shown: RefCell::new(String::new()),
             font_family: config.font.clone(),
             quarter_turns: config.quarter_turns,
             align: config.align,
@@ -202,14 +211,15 @@ impl App {
     /// Shows the source while typing and the formatted text otherwise, each scaled to fill
     /// the screen.
     fn relayout(&self) {
-        let editing = self.raw || self.cursor_visible.get();
+        let editing = self.cursor_visible.get();
         // The editor stays first responder while invisible, so typing switches back to it.
         self.text_view
             .setAlphaValue(if editing { 1.0 } else { 0.0 });
         self.display.setHidden(editing);
 
-        let mut text = self.text_view.string().to_string();
+        let source = self.text_view.string().to_string();
         if editing {
+            let mut text = source;
             // A trailing empty line, where the cursor sits after Return, needs room too.
             if text.is_empty() || text.ends_with('\n') {
                 text.push('M');
@@ -219,7 +229,16 @@ impl App {
             });
             self.text_view.setFont(Some(&self.font_or_system(size)));
         } else {
-            let runs = markdown::parse(&text);
+            let text = placeholders::fill(&source, &Zoned::now(), self.countdown.as_ref());
+            let runs = if self.raw {
+                vec![Run {
+                    text: text.clone(),
+                    style: markdown::PLAIN,
+                }]
+            } else {
+                markdown::parse(&text)
+            };
+            self.shown.replace(text);
             let storage = unsafe { self.display.textStorage() }.expect("text view has storage");
             if runs.is_empty() {
                 storage.setAttributedString(&NSAttributedString::new());
@@ -232,6 +251,27 @@ impl App {
         }
         // Rotated views leave stale pixels behind when they move, so repaint everything.
         self.window.contentView().unwrap().setNeedsDisplay(true);
+    }
+
+    /// Redraws once a second while placeholders change the shown text.
+    fn tick(self: &Rc<Self>) {
+        if !self.cursor_visible.get() {
+            let source = self.text_view.string().to_string();
+            let text = placeholders::fill(&source, &Zoned::now(), self.countdown.as_ref());
+            if *self.shown.borrow() != text {
+                self.relayout();
+            }
+        }
+        let app = self.clone();
+        let block = RcBlock::new(move |_: NonNull<NSTimer>| app.tick());
+        // Fire a moment after the countdown's next full second, or the clock's without one.
+        let phase = self
+            .countdown
+            .as_ref()
+            .map_or(0, |c| c.end.subsec_nanosecond());
+        let wait = (phase - Timestamp::now().subsec_nanosecond()).rem_euclid(1_000_000_000);
+        let delay = f64::from(wait) / 1e9 + 0.001;
+        unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(delay, false, &block) };
     }
 
     /// Picks the font size at which `build` makes text that fills the screen, and places
@@ -284,6 +324,7 @@ impl App {
             if style.italic {
                 font = fonts.convertFont_toHaveTrait(&font, NSFontTraitMask::ItalicFontMask);
             }
+            let font = tabular_digits(&font);
             let mut keys = vec![unsafe { NSFontAttributeName }];
             let mut values = vec![Retained::into_super(Retained::into_super(font))];
             if style.strikethrough {
@@ -487,6 +528,27 @@ fn new_text_view(frame: NSRect, mtm: MainThreadMarker) -> Retained<NSTextView> {
         container.setLineFragmentPadding(0.0);
     }
     view
+}
+
+/// The font with digits of equal width, so ticking numbers keep the text the same size.
+fn tabular_digits(font: &NSFont) -> Retained<NSFont> {
+    // From Apple's SFNTLayoutTypes.h: kNumberSpacingType, kMonospacedNumbersSelector.
+    let feature = NSDictionary::from_retained_objects(
+        &[unsafe { NSFontFeatureTypeIdentifierKey }, unsafe {
+            NSFontFeatureSelectorIdentifierKey
+        }],
+        &[NSNumber::new_i32(6), NSNumber::new_i32(0)],
+    );
+    let features = NSArray::from_retained_slice(&[feature]);
+    let attributes = NSDictionary::from_retained_objects(
+        &[unsafe { NSFontFeatureSettingsAttribute }],
+        &[Retained::into_super(Retained::into_super(features))],
+    );
+    let descriptor = unsafe {
+        font.fontDescriptor()
+            .fontDescriptorByAddingAttributes(&attributes)
+    };
+    NSFont::fontWithDescriptor_size(&descriptor, font.pointSize()).unwrap_or_else(|| font.retain())
 }
 
 fn plain(text: &str, font: &NSFont) -> Retained<NSAttributedString> {

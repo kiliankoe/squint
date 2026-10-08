@@ -1,11 +1,15 @@
 mod app;
 mod layout;
 mod markdown;
+mod placeholders;
 mod stdin;
 
 use clap::Parser;
 
+use jiff::{Timestamp, Zoned};
+
 use crate::layout::{Align, Padding};
+use crate::placeholders::Countdown;
 
 #[derive(Parser, Debug)]
 #[command(version)]
@@ -44,6 +48,19 @@ struct Cli {
     #[arg(long)]
     raw: bool,
 
+    /// Count down for this long, shown in place of {countdown}, e.g. 90 (seconds), 5m or 1h30m
+    #[arg(long, value_parser = parse_timer, group = "countdown")]
+    timer: Option<Timestamp>,
+
+    /// Count down to this local time, shown in place of {countdown}, e.g. 18:00, 2026-12-31
+    /// or 2026-12-31T23:59
+    #[arg(long, value_parser = parse_until, group = "countdown")]
+    until: Option<Timestamp>,
+
+    /// Text to show instead once the countdown reaches zero [default: the countdown stays at 0:00]
+    #[arg(long, requires = "countdown")]
+    zero: Option<String>,
+
     /// Text to show. A single "-" reads it from stdin instead, where a form feed
     /// character (\f) replaces the shown text with what came before it.
     text: Vec<String>,
@@ -74,6 +91,17 @@ pub struct Config {
     pub align: Align,
     pub padding: Padding,
     pub raw: bool,
+    pub countdown: Option<Countdown>,
+}
+
+fn parse_timer(spec: &str) -> Result<Timestamp, String> {
+    Timestamp::now()
+        .checked_add(placeholders::parse_duration(spec)?)
+        .map_err(|e| e.to_string())
+}
+
+fn parse_until(spec: &str) -> Result<Timestamp, String> {
+    placeholders::resolve_until(spec, &Zoned::now())
 }
 
 fn parse_color(spec: &str) -> Result<csscolorparser::Color, String> {
@@ -108,6 +136,10 @@ impl From<Cli> for Config {
             align,
             padding: cli.pad,
             raw: cli.raw,
+            countdown: cli.timer.or(cli.until).map(|end| Countdown {
+                end,
+                zero: cli.zero,
+            }),
         }
     }
 }
@@ -170,6 +202,22 @@ mod tests {
             config(&["-p", "0"]).padding,
             Padding::new(0.0, 0.0, 0.0, 0.0)
         );
+    }
+
+    #[test]
+    fn counts_down_with_either_a_timer_or_an_end_time() {
+        let five_minutes = jiff::SignedDuration::from_mins(5);
+        let before = Timestamp::now();
+        let countdown = config(&["--timer", "5m", "--zero", "Done"])
+            .countdown
+            .unwrap();
+        let after = Timestamp::now();
+        assert!(countdown.end >= before + five_minutes && countdown.end <= after + five_minutes);
+        assert_eq!(countdown.zero.as_deref(), Some("Done"));
+        assert!(config(&["--until", "2099-01-01"]).countdown.is_some());
+        assert_eq!(config(&[]).countdown, None);
+        assert!(Cli::try_parse_from(["squint", "--timer", "5m", "--until", "18:00"]).is_err());
+        assert!(Cli::try_parse_from(["squint", "--zero", "Done"]).is_err());
     }
 
     #[test]
