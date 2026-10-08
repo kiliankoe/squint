@@ -13,6 +13,62 @@ pub enum Align {
     Right,
 }
 
+/// Space kept free at the screen edges, in percent, written in CSS shorthand order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Padding {
+    top: f64,
+    right: f64,
+    bottom: f64,
+    left: f64,
+}
+
+impl Padding {
+    pub const fn new(top: f64, right: f64, bottom: f64, left: f64) -> Self {
+        Padding {
+            top,
+            right,
+            bottom,
+            left,
+        }
+    }
+
+    /// The offset from the bottom left corner, as AppKit counts, and the size of the area
+    /// inside the padding.
+    pub fn inset(&self, screen: Size) -> ((f64, f64), Size) {
+        let percent = |value: f64, of: f64| value / 100.0 * of;
+        (
+            (
+                percent(self.left, screen.width),
+                percent(self.bottom, screen.height),
+            ),
+            Size {
+                width: screen.width - percent(self.left + self.right, screen.width),
+                height: screen.height - percent(self.top + self.bottom, screen.height),
+            },
+        )
+    }
+}
+
+impl std::str::FromStr for Padding {
+    type Err = String;
+
+    fn from_str(spec: &str) -> Result<Self, Self::Err> {
+        let values = spec
+            .split(',')
+            .map(|v| match v.trim().parse::<f64>() {
+                Ok(v) if (0.0..50.0).contains(&v) => Ok(v),
+                _ => Err(format!("\"{v}\" is not a percentage from 0 to below 50")),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        match values[..] {
+            [all] => Ok(Padding::new(all, all, all, all)),
+            [vertical, horizontal] => Ok(Padding::new(vertical, horizontal, vertical, horizontal)),
+            [top, right, bottom, left] => Ok(Padding::new(top, right, bottom, left)),
+            _ => Err("expected 1, 2 or 4 comma-separated values".into()),
+        }
+    }
+}
+
 /// Font size that makes text measured at `reference` points as large as fits on `screen`.
 /// `quarter_turns` is the rotation in 90° steps, as with sm's `-r`.
 pub fn fit_font_size(reference: f64, measured: Size, screen: Size, quarter_turns: u8) -> f64 {
@@ -52,6 +108,27 @@ mod tests {
 
     fn size(width: f64, height: f64) -> Size {
         Size { width, height }
+    }
+
+    #[test]
+    fn parses_padding_shorthands() {
+        assert_eq!("5".parse(), Ok(Padding::new(5.0, 5.0, 5.0, 5.0)));
+        assert_eq!("5,10".parse(), Ok(Padding::new(5.0, 10.0, 5.0, 10.0)));
+        assert_eq!("1,2,3,4".parse(), Ok(Padding::new(1.0, 2.0, 3.0, 4.0)));
+        assert!("1,2,3".parse::<Padding>().is_err());
+        assert!("50".parse::<Padding>().is_err());
+        assert!("-1".parse::<Padding>().is_err());
+        assert!("x".parse::<Padding>().is_err());
+    }
+
+    #[test]
+    fn padding_shrinks_the_screen_by_percentages() {
+        // Top and bottom are relative to the height, left and right to the width.
+        let pad = Padding::new(10.0, 5.0, 20.0, 15.0);
+        assert_eq!(
+            pad.inset(size(1000.0, 500.0)),
+            ((150.0, 100.0), size(800.0, 350.0))
+        );
     }
 
     #[test]

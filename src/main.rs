@@ -4,7 +4,7 @@ mod stdin;
 
 use clap::Parser;
 
-use crate::layout::Align;
+use crate::layout::{Align, Padding};
 
 #[derive(Parser, Debug)]
 #[command(version)]
@@ -32,6 +32,12 @@ struct Cli {
     /// Alignment: 0 centered, 1 left, 2 right
     #[arg(short, long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=2))]
     align: u8,
+
+    /// Space kept free at the screen edges, in percent of the screen height (top, bottom)
+    /// and width (left, right). One value for all sides, two for vertical and horizontal,
+    /// or four for top, right, bottom and left.
+    #[arg(short, long, default_value = "3")]
+    pad: Padding,
 
     /// Text to show. A single "-" reads it from stdin instead, where a form feed
     /// character (\f) replaces the shown text with what came before it.
@@ -61,6 +67,7 @@ pub struct Config {
     pub font: Option<String>,
     pub quarter_turns: u8,
     pub align: Align,
+    pub padding: Padding,
 }
 
 fn parse_color(spec: &str) -> Result<csscolorparser::Color, String> {
@@ -93,6 +100,7 @@ impl From<Cli> for Config {
             font: cli.font,
             quarter_turns: cli.rotate,
             align,
+            padding: cli.pad,
         }
     }
 }
@@ -149,9 +157,16 @@ mod tests {
     }
 
     #[test]
+    fn pads_by_default() {
+        assert_eq!(config(&[]).padding, Padding::new(3.0, 3.0, 3.0, 3.0));
+        assert_eq!(config(&["-p", "0"]).padding, Padding::new(0.0, 0.0, 0.0, 0.0));
+    }
+
+    #[test]
     fn rejects_invalid_values() {
         assert!(Cli::try_parse_from(["squint", "-f", "notacolor"]).is_err());
         assert!(Cli::try_parse_from(["squint", "-r", "4"]).is_err());
         assert!(Cli::try_parse_from(["squint", "-a", "3"]).is_err());
+        assert!(Cli::try_parse_from(["squint", "-p", "1,2,3"]).is_err());
     }
 }

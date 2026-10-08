@@ -17,7 +17,7 @@ Type to edit the text. The cursor appears while typing or clicking and hides aft
 
 With `-`, squint reads stdin. A form feed (`\f`) ends a frame, and each frame replaces the shown text. Input without form feeds is shown once stdin closes.
 
-Run `squint --help` for colors, font, rotation and alignment.
+Run `squint --help` for colors, font, rotation, alignment and padding.
 
 ## Differences from sm
 

@@ -26,7 +26,7 @@ use objc2_foundation::{
     NSProcessInfo, NSRect, NSSize, NSString, NSTimer,
 };
 
-use crate::layout::{self, Align, Size};
+use crate::layout::{self, Align, Padding, Size};
 use crate::stdin::Frames;
 use crate::{Color, Config, Input};
 
@@ -63,6 +63,7 @@ struct App {
     font_family: Option<String>,
     quarter_turns: u8,
     align: Align,
+    padding: Padding,
     colors: RefCell<(Retained<NSColor>, Retained<NSColor>)>,
     cursor_timer: RefCell<Option<Retained<NSTimer>>>,
     cursor_visible: Cell<bool>,
@@ -164,6 +165,7 @@ impl App {
             font_family: config.font.clone(),
             quarter_turns: config.quarter_turns,
             align: config.align,
+            padding: config.padding,
             colors: RefCell::new((ns_color(&config.foreground), ns_color(&config.background))),
             cursor_timer: RefCell::new(None),
             cursor_visible: Cell::new(false),
@@ -198,10 +200,10 @@ impl App {
         let frame = self.window.frame();
         // On notched displays, the strip beside the camera is unusable for text.
         let notch = self.window.screen().map_or(0.0, |s| s.safeAreaInsets().top);
-        let screen = Size {
+        let ((left, bottom), screen) = self.padding.inset(Size {
             width: frame.size.width,
             height: frame.size.height - notch,
-        };
+        });
         let font_for = |size| {
             self.font(size)
                 .unwrap_or_else(|| NSFont::systemFontOfSize(size))
@@ -221,7 +223,7 @@ impl App {
         // Rotation applies around the view's center, so set the unrotated frame first.
         self.text_view.setFrameCenterRotation(0.0);
         self.text_view.setFrame(NSRect::new(
-            NSPoint::new(x, y),
+            NSPoint::new(left + x, bottom + y),
             NSSize::new(measured.width + 1.0, measured.height),
         ));
         // AppKit rotates counterclockwise, sm clockwise.
