@@ -252,7 +252,9 @@ impl App {
     /// the screen. A pasted image takes precedence over both.
     fn relayout(&self) {
         let pasted = self.image.borrow().clone();
-        let editing = self.cursor_visible.get() && pasted.is_none();
+        // Unfinished input method composition has to stay visible while the user pauses.
+        let editing =
+            (self.cursor_visible.get() || self.text_view.hasMarkedText()) && pasted.is_none();
         // The editor stays first responder while invisible, so typing switches back to it.
         self.text_view
             .setAlphaValue(if editing { 1.0 } else { 0.0 });
@@ -511,10 +513,11 @@ impl App {
         let app = self.clone();
         let block = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
             let event_ref = unsafe { event.as_ref() };
-            app.note_activity();
+            // Shortcuts like Ctrl-I would otherwise flash the unformatted source.
             if event_ref.r#type() == NSEventType::KeyDown && app.handle_key(event_ref) {
                 return std::ptr::null_mut();
             }
+            app.note_activity();
             event.as_ptr()
         });
         let monitor = unsafe {
@@ -561,6 +564,7 @@ impl App {
                 if event.isARepeat() {
                     return true;
                 }
+                self.note_activity();
                 if self.image.borrow().is_some() {
                     self.set_image(None);
                     return true;
@@ -582,8 +586,13 @@ impl App {
     fn observe_edits(self: &Rc<Self>) {
         let app = self.clone();
         let block = RcBlock::new(move |_| {
-            // Typing replaces a pasted image.
-            if app.image.borrow().is_some() {
+            // Typing replaces a pasted image. Undoing typing changes the text too, but
+            // must not remove the image that the same undo step restores.
+            let undoing = app
+                .text_view
+                .undoManager()
+                .is_some_and(|undo| undo.isUndoing() || undo.isRedoing());
+            if app.image.borrow().is_some() && !undoing {
                 app.set_image(None);
             } else {
                 app.relayout();
