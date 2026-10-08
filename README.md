@@ -13,6 +13,8 @@ squint
 (while sleep 1; do date +%T; printf '\f'; done) | squint -
 ```
 
+Text is formatted as Markdown: `**bold**`, `*italic*`, `~~strikethrough~~`, `` `code` `` and `#` or `##` headings at the start of a line. Other Markdown, such as lists or links, shows as typed. While you type, squint shows the text unformatted, so the markers stay editable. `--raw` turns formatting off.
+
 Type to edit the text. The cursor appears while typing or clicking and hides after a moment of idling. Esc clears the text (Cmd-Z brings it back), a second Esc quits. Ctrl-I inverts the colors. Ctrl-Q or Cmd-Q quits directly.
 
 With `-`, squint reads stdin. A form feed (`\f`) ends a frame, and each frame replaces the shown text. Input without form feeds is shown once stdin closes.
@@ -22,4 +24,4 @@ Run `squint --help` for colors, font, rotation, alignment and padding.
 ## Differences from sm
 
 - Colors follow the system appearance: black on white in light mode, white on black in dark mode.
-- No kiosk mode (`-k`) and no Pango markup (`-m`).
+- No kiosk mode (`-k`). Markdown replaces Pango markup (`-m`) and is on by default.

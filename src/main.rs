@@ -1,5 +1,6 @@
 mod app;
 mod layout;
+mod markdown;
 mod stdin;
 
 use clap::Parser;
@@ -39,6 +40,10 @@ struct Cli {
     #[arg(short, long, default_value = "3")]
     pad: Padding,
 
+    /// Show the text as typed, without Markdown formatting
+    #[arg(long)]
+    raw: bool,
+
     /// Text to show. A single "-" reads it from stdin instead, where a form feed
     /// character (\f) replaces the shown text with what came before it.
     text: Vec<String>,
@@ -68,6 +73,7 @@ pub struct Config {
     pub quarter_turns: u8,
     pub align: Align,
     pub padding: Padding,
+    pub raw: bool,
 }
 
 fn parse_color(spec: &str) -> Result<csscolorparser::Color, String> {
@@ -101,6 +107,7 @@ impl From<Cli> for Config {
             quarter_turns: cli.rotate,
             align,
             padding: cli.pad,
+            raw: cli.raw,
         }
     }
 }
@@ -159,7 +166,10 @@ mod tests {
     #[test]
     fn pads_by_default() {
         assert_eq!(config(&[]).padding, Padding::new(3.0, 3.0, 3.0, 3.0));
-        assert_eq!(config(&["-p", "0"]).padding, Padding::new(0.0, 0.0, 0.0, 0.0));
+        assert_eq!(
+            config(&["-p", "0"]).padding,
+            Padding::new(0.0, 0.0, 0.0, 0.0)
+        );
     }
 
     #[test]

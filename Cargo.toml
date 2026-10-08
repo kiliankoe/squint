@@ -11,3 +11,4 @@ dispatch2 = "0.3"
 objc2 = "0.6"
 objc2-app-kit = "0.3"
 objc2-foundation = "0.3"
+pulldown-cmark = { version = "0.13.4", default-features = false }

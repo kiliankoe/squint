@@ -1,5 +1,6 @@
 //! The fullscreen window. An `NSTextView` does the editing, so input methods, paste,
 //! undo and the emoji picker work without extra code. We only resize and place it.
+//! While the cursor is hidden, a second, read-only view shows the formatted text instead.
 
 use std::cell::{Cell, RefCell};
 use std::io::Read;
@@ -11,22 +12,24 @@ use block2::RcBlock;
 use dispatch2::{DispatchQueue, MainThreadBound};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+use objc2::{MainThreadMarker, MainThreadOnly, Message, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
     NSApplicationActivationPolicy, NSApplicationPresentationOptions,
     NSAttributedStringNSExtendedStringDrawing, NSBackingStoreType, NSColor, NSCursor, NSEvent,
     NSEventMask, NSEventModifierFlags, NSEventType, NSFont, NSFontAttributeName, NSFontManager,
-    NSFontTraitMask, NSMenu, NSMenuItem, NSScreen, NSStringDrawingOptions, NSTextAlignment,
+    NSFontTraitMask, NSFontWeightRegular, NSMenu, NSMenuItem, NSScreen,
+    NSStrikethroughStyleAttributeName, NSStringDrawingOptions, NSTextAlignment,
     NSTextDidChangeNotification, NSTextInputClient, NSTextInputTraitType, NSTextView, NSWindow,
     NSWindowStyleMask,
 };
 use objc2_foundation::{
-    NSActivityOptions, NSArray, NSAttributedString, NSDictionary, NSNotificationCenter, NSPoint,
-    NSProcessInfo, NSRect, NSSize, NSString, NSTimer,
+    NSActivityOptions, NSArray, NSAttributedString, NSDictionary, NSMutableAttributedString,
+    NSNotificationCenter, NSNumber, NSPoint, NSProcessInfo, NSRect, NSSize, NSString, NSTimer,
 };
 
 use crate::layout::{self, Align, Padding, Size};
+use crate::markdown::{self, Run};
 use crate::stdin::Frames;
 use crate::{Color, Config, Input};
 
@@ -60,12 +63,15 @@ define_class!(
 struct App {
     window: Retained<KeyWindow>,
     text_view: Retained<NSTextView>,
+    display: Retained<NSTextView>,
+    raw: bool,
     font_family: Option<String>,
     quarter_turns: u8,
     align: Align,
     padding: Padding,
     colors: RefCell<(Retained<NSColor>, Retained<NSColor>)>,
     cursor_timer: RefCell<Option<Retained<NSTimer>>>,
+    /// Whether the user is typing, which shows the cursor and the unformatted source.
     cursor_visible: Cell<bool>,
 }
 
@@ -128,23 +134,14 @@ impl App {
         unsafe { window.setReleasedWhenClosed(false) };
         window.setFrame_display(frame, true);
 
-        let text_view = NSTextView::initWithFrame(NSTextView::alloc(mtm), frame);
+        let text_view = new_text_view(frame, mtm);
         text_view.setRichText(false);
-        text_view.setDrawsBackground(false);
         text_view.setAllowsUndo(true);
-        text_view.setHorizontallyResizable(false);
-        text_view.setVerticallyResizable(false);
-        text_view.setTextContainerInset(NSSize::ZERO);
         text_view.setAlignment(match config.align {
             Align::Center => NSTextAlignment::Center,
             Align::Left => NSTextAlignment::Left,
             Align::Right => NSTextAlignment::Right,
         });
-        if let Some(container) = unsafe { text_view.textContainer() } {
-            container.setWidthTracksTextView(false);
-            container.setHeightTracksTextView(false);
-            container.setLineFragmentPadding(0.0);
-        }
         // The text is shown verbatim, so anything that rewrites or annotates it stays off.
         text_view.setAutomaticQuoteSubstitutionEnabled(false);
         text_view.setAutomaticDashSubstitutionEnabled(false);
@@ -155,13 +152,20 @@ impl App {
         text_view.setAutomaticTextCompletionEnabled(false);
         text_view.setInlinePredictionType(NSTextInputTraitType::No);
 
+        let display = new_text_view(frame, mtm);
+        display.setEditable(false);
+        display.setSelectable(false);
+
         let content = window.contentView().expect("window has a content view");
+        content.addSubview(&display);
         content.addSubview(&text_view);
         window.makeFirstResponder(Some(&text_view));
 
         let app = App {
             window,
             text_view,
+            display,
+            raw: config.raw,
             font_family: config.font.clone(),
             quarter_turns: config.quarter_turns,
             align: config.align,
@@ -179,6 +183,11 @@ impl App {
         app
     }
 
+    fn font_or_system(&self, size: f64) -> Retained<NSFont> {
+        self.font(size)
+            .unwrap_or_else(|| NSFont::systemFontOfSize(size))
+    }
+
     fn font(&self, size: f64) -> Option<Retained<NSFont>> {
         let Some(family) = &self.font_family else {
             return Some(NSFont::systemFontOfSize(size));
@@ -190,13 +199,44 @@ impl App {
             .or_else(|| NSFont::fontWithName_size(&name, size))
     }
 
-    /// Scales the text to fill the screen and places it there.
+    /// Shows the source while typing and the formatted text otherwise, each scaled to fill
+    /// the screen.
     fn relayout(&self) {
+        let editing = self.raw || self.cursor_visible.get();
+        // The editor stays first responder while invisible, so typing switches back to it.
+        self.text_view
+            .setAlphaValue(if editing { 1.0 } else { 0.0 });
+        self.display.setHidden(editing);
+
         let mut text = self.text_view.string().to_string();
-        // A trailing empty line, where the cursor sits after Return, needs room too.
-        if text.is_empty() || text.ends_with('\n') {
-            text.push('M');
+        if editing {
+            // A trailing empty line, where the cursor sits after Return, needs room too.
+            if text.is_empty() || text.ends_with('\n') {
+                text.push('M');
+            }
+            let size = self.place(&self.text_view, |size| {
+                plain(&text, &self.font_or_system(size))
+            });
+            self.text_view.setFont(Some(&self.font_or_system(size)));
+        } else {
+            let runs = markdown::parse(&text);
+            let storage = unsafe { self.display.textStorage() }.expect("text view has storage");
+            if runs.is_empty() {
+                storage.setAttributedString(&NSAttributedString::new());
+            } else {
+                let size = self.place(&self.display, |size| self.styled(&runs, size));
+                storage.setAttributedString(&self.styled(&runs, size));
+                self.display.setTextColor(Some(&self.colors.borrow().0));
+                self.display.setAlignment(self.text_view.alignment());
+            }
         }
+        // Rotated views leave stale pixels behind when they move, so repaint everything.
+        self.window.contentView().unwrap().setNeedsDisplay(true);
+    }
+
+    /// Picks the font size at which `build` makes text that fills the screen, and places
+    /// `view` to show that text. Returns the font size.
+    fn place(&self, view: &NSTextView, build: impl Fn(f64) -> Retained<NSAttributedString>) -> f64 {
         let frame = self.window.frame();
         // On notched displays, the strip beside the camera is unusable for text.
         let notch = self.window.screen().map_or(0.0, |s| s.safeAreaInsets().top);
@@ -204,33 +244,61 @@ impl App {
             width: frame.size.width,
             height: frame.size.height - notch,
         });
-        let font_for = |size| {
-            self.font(size)
-                .unwrap_or_else(|| NSFont::systemFontOfSize(size))
-        };
 
-        let reference = measure(&text, &font_for(REFERENCE_SIZE));
+        let reference = measure(&build(REFERENCE_SIZE));
         let size = layout::fit_font_size(REFERENCE_SIZE, reference, screen, self.quarter_turns);
-        let font = font_for(size);
-        let measured = measure(&text, &font);
+        let measured = measure(&build(size));
 
-        self.text_view.setFont(Some(&font));
-        if let Some(container) = unsafe { self.text_view.textContainer() } {
+        if let Some(container) = unsafe { view.textContainer() } {
             // Slightly wider than measured, so rounding never wraps a line.
             container.setSize(NSSize::new(measured.width + 1.0, f64::MAX));
         }
         let (x, y) = layout::text_origin(measured, screen, self.quarter_turns, self.align);
         // Rotation applies around the view's center, so set the unrotated frame first.
-        self.text_view.setFrameCenterRotation(0.0);
-        self.text_view.setFrame(NSRect::new(
+        view.setFrameCenterRotation(0.0);
+        view.setFrame(NSRect::new(
             NSPoint::new(left + x, bottom + y),
             NSSize::new(measured.width + 1.0, measured.height),
         ));
         // AppKit rotates counterclockwise, sm clockwise.
-        self.text_view
-            .setFrameCenterRotation(-90.0 * f64::from(self.quarter_turns));
-        // Rotated views leave stale pixels behind when they move, so repaint everything.
-        self.window.contentView().unwrap().setNeedsDisplay(true);
+        view.setFrameCenterRotation(-90.0 * f64::from(self.quarter_turns));
+        size
+    }
+
+    /// Formatted text with body text at `size` points.
+    fn styled(&self, runs: &[Run], size: f64) -> Retained<NSAttributedString> {
+        let mtm = MainThreadMarker::from(&*self.text_view);
+        let fonts = NSFontManager::sharedFontManager(mtm);
+        let result = NSMutableAttributedString::new();
+        for run in runs {
+            let style = run.style;
+            let size = size * style.scale;
+            let mut font = if style.code {
+                NSFont::monospacedSystemFontOfSize_weight(size, unsafe { NSFontWeightRegular })
+            } else {
+                self.font_or_system(size)
+            };
+            if style.bold {
+                font = fonts.convertFont_toHaveTrait(&font, NSFontTraitMask::BoldFontMask);
+            }
+            if style.italic {
+                font = fonts.convertFont_toHaveTrait(&font, NSFontTraitMask::ItalicFontMask);
+            }
+            let mut keys = vec![unsafe { NSFontAttributeName }];
+            let mut values = vec![Retained::into_super(Retained::into_super(font))];
+            if style.strikethrough {
+                keys.push(unsafe { NSStrikethroughStyleAttributeName });
+                values.push(Retained::into_super(Retained::into_super(
+                    Retained::into_super(NSNumber::new_i32(1)),
+                )));
+            }
+            let attributes = NSDictionary::from_retained_objects(&keys, &values);
+            let text = unsafe {
+                NSAttributedString::new_with_attributes(&NSString::from_str(&run.text), &attributes)
+            };
+            result.appendAttributedString(&text);
+        }
+        Retained::into_super(result)
     }
 
     fn show_frame(&self, text: &str) {
@@ -246,6 +314,7 @@ impl App {
         let (foreground, background) = &*self.colors.borrow();
         self.window.setBackgroundColor(Some(background));
         self.text_view.setTextColor(Some(foreground));
+        self.display.setTextColor(Some(foreground));
         self.set_cursor_visible(self.cursor_visible.get());
     }
 
@@ -258,9 +327,12 @@ impl App {
         self.apply_colors();
     }
 
-    /// Shows or hides both the insertion point and the selection highlight.
+    /// Shows or hides the insertion point and the selection highlight, and switches between
+    /// the source and the formatted text.
     fn set_cursor_visible(&self, visible: bool) {
-        self.cursor_visible.set(visible);
+        if self.cursor_visible.replace(visible) != visible {
+            self.relayout();
+        }
         let clear = NSColor::clearColor();
         let foreground = &self.colors.borrow().0;
         self.text_view
@@ -402,13 +474,30 @@ fn read_stdin(app: Arc<MainThreadBound<Rc<App>>>) {
     });
 }
 
-fn measure(text: &str, font: &Retained<NSFont>) -> Size {
+/// A text view that only shows what it is given, positioned and sized by `App::place`.
+fn new_text_view(frame: NSRect, mtm: MainThreadMarker) -> Retained<NSTextView> {
+    let view = NSTextView::initWithFrame(NSTextView::alloc(mtm), frame);
+    view.setDrawsBackground(false);
+    view.setHorizontallyResizable(false);
+    view.setVerticallyResizable(false);
+    view.setTextContainerInset(NSSize::ZERO);
+    if let Some(container) = unsafe { view.textContainer() } {
+        container.setWidthTracksTextView(false);
+        container.setHeightTracksTextView(false);
+        container.setLineFragmentPadding(0.0);
+    }
+    view
+}
+
+fn plain(text: &str, font: &NSFont) -> Retained<NSAttributedString> {
     let attributes = NSDictionary::from_retained_objects(
         &[unsafe { NSFontAttributeName }],
-        &[Retained::into_super(Retained::into_super(font.clone()))],
+        &[Retained::into_super(Retained::into_super(font.retain()))],
     );
-    let string =
-        unsafe { NSAttributedString::new_with_attributes(&NSString::from_str(text), &attributes) };
+    unsafe { NSAttributedString::new_with_attributes(&NSString::from_str(text), &attributes) }
+}
+
+fn measure(string: &NSAttributedString) -> Size {
     let rect = string.boundingRectWithSize_options_context(
         NSSize::new(f64::MAX, f64::MAX),
         NSStringDrawingOptions::UsesLineFragmentOrigin,
